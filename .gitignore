@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 *.bkp_*.xlsx
 ~temp_*.xlsx
+config.env

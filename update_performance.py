@@ -7,6 +7,8 @@ Le relatorios do ML e Shopee e atualiza a planilha de performance.
 import os
 import re
 import sys
+import json
+import base64
 import shutil
 from copy import copy
 from datetime import date, datetime
@@ -129,6 +131,195 @@ SITE_COLS = {
 }
 SITE_FORMULA_COLS = set()
 SITE_LINHA_DADOS  = 4
+
+
+# -------------------------------------------------------------------------------
+# API KEY
+# -------------------------------------------------------------------------------
+
+def carregar_api_key():
+    """Carrega a chave da Anthropic do config.env ou variavel de ambiente."""
+    config = Path(__file__).parent / "config.env"
+    if config.exists():
+        for line in config.read_text().splitlines():
+            if line.startswith("ANTHROPIC_API_KEY="):
+                return line.split("=", 1)[1].strip()
+    return os.environ.get("ANTHROPIC_API_KEY")
+
+
+# -------------------------------------------------------------------------------
+# VISAO COM IA (Claude)
+# -------------------------------------------------------------------------------
+
+PROMPT_VISAO = """Analise esta captura de tela de um painel de marketing e identifique o tipo:
+
+- "ml_ads": Publicidade Mercado Livre (tem "Vendas por Product Ads" e grafico de barras azul)
+- "ml_af": Afiliados Mercado Livre (tem abas "Rendimento geral", "Metricas de campanhas", "Metricas de afiliados")
+- "shopee_af": Afiliados Shopee (tem "Principais Indicadores", abas "Shopee Live", "Shopee Video")
+
+Retorne APENAS um JSON (sem texto adicional):
+
+Se ml_ads:   {"tipo":"ml_ads","impressoes":N,"cliques":N,"vendas_product_ads":N,"vendas_sem_products":N,"investimento":N.NN,"receita":N.NN}
+Se ml_af:    {"tipo":"ml_af","receita":N.NN,"unidades":N,"qtd_vendas":N,"custo":N.NN}
+Se shopee_af:{"tipo":"shopee_af","vendas":N.NN,"itens_brutos":N,"pedidos":N,"cliques":N,"comissao":N.NN,"roi":N.N,"compradores_totais":N,"novos_compradores":N}
+
+Regras importantes:
+- Valores monetarios: apenas o numero sem R$ (ex: 22314.47)
+- "70mil" ou "R$70mil" = 70000.0
+- "14,8mil" = 14800
+- "3,6mil" = 3600.0
+- "11.332.096" (formato BR com pontos) = 11332096
+- Nao incluir percentuais no JSON"""
+
+CAMPOS_IA = {
+    "ml_ads": {
+        "impressoes":         "pub_impressoes",
+        "cliques":            "pub_cliques",
+        "vendas_product_ads": "pub_vendas_product_ads",
+        "vendas_sem_products":"pub_vendas_sem_products",
+        "investimento":       "pub_investimento",
+        "receita":            "pub_receita",
+    },
+    "ml_af": {
+        "receita":    "af_receita",
+        "unidades":   "af_unidades",
+        "qtd_vendas": "af_qtd_vendas",
+        "custo":      "af_custo",
+    },
+    "shopee_af": {
+        "vendas":             "af_vendas",
+        "itens_brutos":       "af_itens_brutos",
+        "pedidos":            "af_pedidos",
+        "cliques":            "af_cliques",
+        "comissao":           "af_comissao",
+        "roi":                "af_roi",
+        "compradores_totais": "af_compradores_totais",
+        "novos_compradores":  "af_novos_compradores",
+    },
+}
+
+LABELS_TIPO = {
+    "ml_ads":    "ML -- Publicidade",
+    "ml_af":     "ML -- Afiliados",
+    "shopee_af": "Shopee -- Afiliados",
+}
+
+LABELS_CAMPO = {
+    "impressoes": "Impressoes", "cliques": "Cliques",
+    "vendas_product_ads": "Vendas Product Ads", "vendas_sem_products": "Vendas sem Products",
+    "investimento": "Investimento (R$)", "receita": "Receita (R$)",
+    "unidades": "Unidades vendidas", "qtd_vendas": "Qtd vendas", "custo": "Custo estimado (R$)",
+    "vendas": "Vendas (R$)", "itens_brutos": "Itens brutos", "pedidos": "Pedidos",
+    "comissao": "Comissao (R$)", "roi": "ROI",
+    "compradores_totais": "Compradores totais", "novos_compradores": "Novos compradores",
+}
+
+
+def extrair_dados_imagem_claude(caminho, api_key):
+    """Envia imagem para o Claude e retorna dicionario com tipo e valores."""
+    import anthropic
+
+    ext = caminho.suffix.lower()
+    media_type = "image/jpeg" if ext in (".jpg", ".jpeg") else "image/png"
+
+    with open(str(caminho), "rb") as f:
+        img_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    client = anthropic.Anthropic(api_key=api_key)
+    resp = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=512,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}},
+                {"type": "text",  "text": PROMPT_VISAO},
+            ],
+        }],
+    )
+
+    texto = resp.content[0].text.strip()
+    m = re.search(r"\{.*\}", texto, re.DOTALL)
+    if m:
+        return json.loads(m.group())
+    return None
+
+
+def processar_imagens_ia(imagens, api_key):
+    """Processa todas as imagens com IA e retorna dados para ML e Shopee."""
+    dados_ml     = {}
+    dados_shopee = {}
+
+    for img in sorted(imagens):
+        print(f"\n  Analisando: {img.name} ...")
+        try:
+            resultado = extrair_dados_imagem_claude(img, api_key)
+        except Exception as e:
+            print(f"  [!] Erro na IA: {e}")
+            resultado = None
+
+        if not resultado or "tipo" not in resultado:
+            print("  [!] Nao foi possivel ler automaticamente. Entrada manual:")
+            _fallback_manual(img, dados_ml, dados_shopee)
+            continue
+
+        tipo = resultado["tipo"]
+        print(f"  [OK] Tipo identificado: {LABELS_TIPO.get(tipo, tipo)}")
+        print("  Valores extraidos:")
+        for chave_ia in CAMPOS_IA.get(tipo, {}):
+            val = resultado.get(chave_ia)
+            if val is not None:
+                label = LABELS_CAMPO.get(chave_ia, chave_ia)
+                s = f"{val:,.2f}" if isinstance(val, float) else f"{val:,}"
+                print(f"    {label}: {s}")
+
+        resp = input("  Confirmar? [S/n/e(ditar)]: ").strip().lower()
+
+        if resp == "n":
+            print("  Pulando.")
+            continue
+
+        if resp == "e":
+            for chave_ia in CAMPOS_IA.get(tipo, {}):
+                val_atual = resultado.get(chave_ia, "")
+                novo = input(f"    {LABELS_CAMPO.get(chave_ia, chave_ia)} [{val_atual}]: ").strip()
+                if novo:
+                    resultado[chave_ia] = limpar_numero(novo)
+
+        # Mapear para colunas da planilha
+        destino = dados_ml if tipo in ("ml_ads", "ml_af") else dados_shopee
+        for chave_ia, chave_col in CAMPOS_IA.get(tipo, {}).items():
+            if chave_ia in resultado and resultado[chave_ia] is not None:
+                destino[chave_col] = resultado[chave_ia]
+
+    return dados_ml, dados_shopee
+
+
+def _fallback_manual(img, dados_ml, dados_shopee):
+    """Fallback de entrada manual quando a IA falha."""
+    abrir_imagem(img)
+    tipos = {
+        "1": ("ML -- Publicidade", "ml_ads"),
+        "2": ("ML -- Afiliados",   "ml_af"),
+        "3": ("Shopee -- Afiliados","shopee_af"),
+        "0": ("Ignorar", None),
+    }
+    for k, (desc, _) in tipos.items():
+        print(f"  [{k}] {desc}")
+    while True:
+        op = input("  Tipo: ").strip()
+        if op in tipos:
+            break
+    tipo = tipos[op][1]
+    if not tipo:
+        return
+
+    if tipo == "ml_ads":
+        dados_ml.update(coletar_ml_ads(img))
+    elif tipo == "ml_af":
+        dados_ml.update(coletar_ml_afiliados(img))
+    elif tipo == "shopee_af":
+        dados_shopee.update(coletar_shopee_afiliados(img))
 
 
 # -------------------------------------------------------------------------------
@@ -727,41 +918,17 @@ def main():
     else:
         print("\n[!] CSV de anuncios Shopee nao encontrado em materiais.")
 
-    # 6. Imagens (interativo)
-    imagens = sorted(arqs["imagens"])
+    # 6. Imagens (IA automatica)
+    imagens = arqs["imagens"]
     if imagens:
+        api_key = carregar_api_key()
         print(f"\n{'='*62}")
-        print(f"  IMAGENS ({len(imagens)} encontradas) -- identificacao necessaria")
+        print(f"  IMAGENS ({len(imagens)} encontradas) -- leitura automatica com IA")
         print(f"{'='*62}")
 
-        tipos = {
-            "1": "ML -- Publicidade (grafico azul)",
-            "2": "ML -- Afiliados (Metricas / Rendimento geral)",
-            "3": "Shopee -- Afiliados (Principais Indicadores)",
-            "4": "Site -- dados",
-            "0": "Ignorar",
-        }
-
-        classificadas = {}
-        for img in imagens:
-            print(f"\nImagem: {img.name}")
-            abrir_imagem(img)
-            for k, desc in tipos.items():
-                print(f"  [{k}] {desc}")
-            while True:
-                op = input("  Tipo: ").strip()
-                if op in tipos:
-                    break
-                print("  Opcao invalida.")
-            if op != "0":
-                classificadas[op] = img
-
-        if "1" in classificadas:
-            dados_ml.update(coletar_ml_ads(classificadas["1"]))
-        if "2" in classificadas:
-            dados_ml.update(coletar_ml_afiliados(classificadas["2"]))
-        if "3" in classificadas:
-            dados_shopee.update(coletar_shopee_afiliados(classificadas["3"]))
+        img_ml, img_sh = processar_imagens_ia(imagens, api_key)
+        dados_ml.update(img_ml)
+        dados_shopee.update(img_sh)
 
     # 7. Site (interativo)
     dados_site = coletar_site()
