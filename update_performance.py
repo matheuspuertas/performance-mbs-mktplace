@@ -22,7 +22,7 @@ import pandas as pd
 # -------------------------------------------------------------------------------
 
 PERFORMANCE_FILE = r"P:\Meu Drive\Empresas\MBS Pro Grooming\Performance MBS MKTPLACE.xlsx"
-MATERIAIS_DIR    = r"P:\Meu Drive\Empresas\MBS Pro Grooming\materiais"
+MATERIAIS_DIR    = r"P:\Meu Drive\Empresas\MBS Pro Grooming\Desenvolvimento de relatórios"
 
 MESES_PT = {
     1: "jan", 2: "fev", 3: "mar",  4: "abr",
